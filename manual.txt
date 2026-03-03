@@ -1,0 +1,156 @@
+import os
+import json
+import re
+from pathlib import Path
+
+from fastapi import FastAPI
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# =========================
+# BOOT
+# =========================
+
+load_dotenv()
+app = FastAPI()
+
+client = OpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=os.getenv("HF_TOKEN", "").strip(),
+)
+
+# =========================
+# ARQUIVOS (manual + config)
+# =========================
+
+def carregar_manual() -> str:
+    manual_path = Path(__file__).parent / "manual.txt"
+    if not manual_path.exists():
+        return ""
+    return manual_path.read_text(encoding="utf-8").strip()
+
+MANUAL_TEXTO = carregar_manual()
+
+def carregar_config() -> dict:
+    cfg_path = Path(__file__).parent / "cliente_config.json"
+    if not cfg_path.exists():
+        # fallback seguro se o arquivo não existir
+        return {
+            "cliente_nome": "Efinance",
+            "produto_nome": "ERP/CRM",
+            "prompts": {
+                "suporte": [
+                    "Você é um atendente humano de SUPORTE TÉCNICO da empresa {cliente_nome}.",
+                    "Responda em português do Brasil.",
+                    "Nunca diga que é robô/IA.",
+                    "Seja objetivo (máx 8 linhas). Quando precisar, faça até 3 perguntas.",
+                    "Quando orientar, use passos numerados."
+                ]
+            }
+        }
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+CFG = carregar_config()
+
+# =========================
+# REGRAS FIXAS (sempre no topo)
+# =========================
+
+REGRAS_FIXAS_SUPORTE = (
+    "REGRAS GERAIS DE ATENDIMENTO (OBRIGATÓRIO):\n"
+    "1) Cumprimente o cliente de forma educada e humanizada.\n"
+    "2) Identifique-se como atendente de suporte da Efinance.\n"
+    "3) ANTES de qualquer orientação técnica, solicite o número da EMPRESA e o número da LOJA.\n"
+    "4) Se o cliente não informar EMPRESA e LOJA, NÃO avance no atendimento técnico. Reforce a necessidade dos dados.\n"
+)
+
+def montar_prompt(modo: str) -> str:
+    modo = (modo or "suporte").lower().strip()
+    prompts = CFG.get("prompts", {})
+    if modo not in prompts:
+        modo = "suporte"
+
+    linhas = prompts.get(modo, [])
+    prompt_cliente = "\n".join(linhas).strip().format(
+        cliente_nome=CFG.get("cliente_nome", "Efinance"),
+        produto_nome=CFG.get("produto_nome", "ERP/CRM"),
+    )
+
+    partes = []
+
+    # regras primeiro (sempre)
+    if modo == "suporte":
+        partes.append(REGRAS_FIXAS_SUPORTE)
+
+    # manual depois (procedimentos)
+    if MANUAL_TEXTO:
+        partes.append("MANUAL / BASE DE CONHECIMENTO:\n" + MANUAL_TEXTO)
+
+    # prompt do modo por último
+    partes.append("INSTRUÇÕES DO ATENDENTE:\n" + prompt_cliente)
+
+    return "\n\n---\n\n".join(partes)
+
+# =========================
+# TRAVA: exigir EMPRESA + LOJA
+# =========================
+
+def extrair_empresa_loja(texto: str):
+    """
+    Aceita exemplos:
+    - empresa 123 loja 4
+    - empresa:123 loja:04
+    - empresa=123; loja=4
+    """
+    t = (texto or "").lower()
+
+    m_emp = re.search(r"(empresa)\s*[:=]?\s*(\d{1,10})", t)
+    m_loja = re.search(r"(loja)\s*[:=]?\s*(\d{1,10})", t)
+
+    empresa = m_emp.group(2) if m_emp else None
+    loja = m_loja.group(2) if m_loja else None
+
+    return empresa, loja
+
+def resposta_pedir_empresa_loja():
+    return (
+        "Efinance, boa tarde! 😊\n"
+        "Para eu identificar seu cadastro e seguir com o suporte, por favor me informe:\n"
+        "1) Número da EMPRESA\n"
+        "2) Número da LOJA\n\n"
+        "Exemplo: empresa 123 loja 4"
+    )
+
+# =========================
+# ROTAS
+# =========================
+
+@app.get("/")
+def home():
+    return {"status": "Agente IA rodando corretamente"}
+
+@app.get("/pergunta")
+def perguntar(texto: str, modo: str = "suporte"):
+    modo_ok = (modo or "suporte").lower().strip()
+
+    # ✅ trava só no suporte (como Zendesk real)
+    if modo_ok == "suporte":
+        empresa, loja = extrair_empresa_loja(texto)
+        if not empresa or not loja:
+            return {"modo": modo_ok, "resposta": resposta_pedir_empresa_loja()}
+
+    prompt_sistema = montar_prompt(modo_ok)
+
+    r = client.chat.completions.create(
+        model="mistralai/Mistral-7B-Instruct-v0.2",
+        temperature=0.3,
+        max_tokens=260,
+        messages=[
+            {"role": "system", "content": prompt_sistema},
+            {"role": "user", "content": texto},
+        ],
+    )
+
+    return {"modo": modo_ok, "resposta": r.choices[0].message.content}
